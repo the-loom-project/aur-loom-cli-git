@@ -1,0 +1,9 @@
+*
+!.gitignore
+!PKGBUILD
+!.SRCINFO
+!update.sh
+!.github/
+!.github/workflows/
+!.github/workflows/*.yml
+!README.md

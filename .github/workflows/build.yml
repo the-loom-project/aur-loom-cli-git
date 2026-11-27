@@ -1,0 +1,107 @@
+name: Build and publish AUR package
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: [PKGBUILD, .SRCINFO]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: aur
+  cancel-in-progress: false
+
+env:
+  AUR_PKG: loom-cli-git
+  GIT_NAME: Raafat Turki
+  GIT_EMAIL: raafat.turki@proton.me
+
+jobs:
+  build:
+    # builds upstream HEAD to catch breakage, publishes only when the packaging itself changed
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm git go openssh
+          useradd -m builder
+
+      - uses: actions/checkout@v4
+
+      - name: Build from upstream HEAD
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          runuser -u builder -- ./update.sh
+
+      - name: Publish to AUR
+        if: github.event_name == 'push' && vars.AUR_PUSH == 'true'
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          # publish the files as committed, not the pkgver the build check just refreshed
+          git checkout -- PKGBUILD .SRCINFO
+          msg=$(git log -1 --format=%s)
+
+          ssh_dir="$HOME/.ssh"
+          install -dm700 "$ssh_dir"
+          printf '%s\n' "$AUR_SSH_KEY" > "$ssh_dir/aur"
+          chmod 600 "$ssh_dir/aur"
+          ssh-keyscan aur.archlinux.org > "$ssh_dir/known_hosts"
+          test -s "$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/aur -o UserKnownHostsFile=$ssh_dir/known_hosts"
+
+          git config --global user.name  "$GIT_NAME"
+          git config --global user.email "$GIT_EMAIL"
+
+          git clone "ssh://aur@aur.archlinux.org/$AUR_PKG.git" /tmp/aur
+          cp PKGBUILD .SRCINFO /tmp/aur/
+          git -C /tmp/aur checkout -B master
+          git -C /tmp/aur add PKGBUILD .SRCINFO
+          if git -C /tmp/aur diff --cached --quiet; then
+            echo "AUR already has this PKGBUILD"
+          else
+            git -C /tmp/aur commit -m "$msg"
+            git -C /tmp/aur push origin HEAD:master
+          fi
+
+
+  notify-failure:
+    # creates issue if workflow fails
+    needs: build
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Open an issue unless one is already open
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="AUR build workflow failed"
+          if [ -z "$(gh issue list -R "$REPO" --state open --search "\"$title\" in:title" --json number --jq '.[].number')" ]; then
+            gh issue create -R "$REPO" --title "$title" --body "see $RUN_URL"
+          fi
+
+
+  keepalive:
+    # github disables scheduled workflows after 60 days without repo activity, which is the normal state of a -git package repo
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add an empty commit if the last one is over 45 days old
+        run: |
+          last=$(git log -1 --format=%ct)
+          if (( $(date +%s) - last > 45*24*3600 )); then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keepalive"
+            git push
+          fi
